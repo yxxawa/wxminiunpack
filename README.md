@@ -1,9 +1,4 @@
 # wxminiunpack
-
-<p align="center">
-  <img src="docs/assets/scan-light.png" alt="微信小程序一键反编译 · 自动扫描界面" width="860">
-</p>
-
 <p align="center">
   <strong>面向 Windows 的 C++20 + WebView2 wxapkg 批量反编译工具</strong><br>
   自动发现本机微信缓存，按小程序/小游戏聚合主包、分包、通用插件与运行时缓存，也支持手动导入多个 WXID 文件夹。
