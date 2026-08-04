@@ -1,6 +1,6 @@
 # <h1 align="center">wxminiunpack</h1>
 <p align="center">
-  <strong>面向 Windows 的 C++20 + WebView2 wxapkg 批量反编译工具</strong><br>
+  <strong>面向 Windows 的wxapkg 批量反编译工具</strong><br>
   自动发现本机微信缓存，按小程序/小游戏聚合主包、分包、通用插件与运行时缓存，也支持手动导入多个 WXID 文件夹。
 </p>
 
@@ -11,7 +11,6 @@
   <img src="https://img.shields.io/badge/License-GPL--3.0--or--later-f59e0b?style=flat-square" alt="GPL-3.0-or-later">
 </p>
 
-> 这是一个本地优先工具。项目已移除软件层面的注册码、机器码绑定、授权存储、VMProtect SDK 与加壳流程；wxapkg 包本身可能使用的加密格式处理仍然保留，因为它是解包功能的一部分。名称补全优先读取本地缓存，部分公开元数据解析会按需访问网络；没有在线登录或在线授权。
 
 ## 功能亮点
 
