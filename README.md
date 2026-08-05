@@ -36,16 +36,6 @@
 
 ## 快速开始
 
-### 运行环境
-
-- Windows 10/11 x64
-- Microsoft Visual Studio 2022/2026 Build Tools，安装 **Desktop development with C++**
-- CMake 3.24 或更高版本
-- Ninja
-- Microsoft Edge WebView2 Evergreen Runtime
-
-仓库已经携带 WebView2 C++ 头文件和 x64 静态加载库；运行时仍需要系统安装 WebView2 Evergreen Runtime。
-
 ### 编译
 
 在 **x64 Native Tools Command Prompt for Visual Studio** 或已经加载 MSVC 环境的 PowerShell 中执行：
