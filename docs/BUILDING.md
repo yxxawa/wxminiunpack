@@ -28,9 +28,14 @@ ctest --preset windows-x64-release --output-on-failure
 当前核心回归覆盖：
 
 - wxapkg 文件头与索引读取
+- 损坏索引、重复插件条目、加密格式与错误 WXID
 - 相对路径安全校验
 - 运行时名称证据提取
 - 基础项目重建路径
+- JS 容器、内嵌 JSON、WXSS、配置保留及未恢复文件报告
+- 手动导入的版本优先级
+
+核心测试在 Release 模式也会启用断言。真实样本检查见 [解包检查记录](UNPACKING_AUDIT.md)。
 
 ## 4. 安装到发布目录
 

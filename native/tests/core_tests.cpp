@@ -30,7 +30,8 @@ std::vector<std::byte> make_single_file_package(const std::string& name, const s
   const auto index_end = static_cast<std::size_t>(18 + entry_length);
   std::vector<std::byte> package(index_end + content.size());
   package[0] = static_cast<std::byte>(0xbe);
-  put_u32_be(package, 5, entry_length);
+  put_u32_be(package, 5, 4 + entry_length);
+  put_u32_be(package, 9, static_cast<std::uint32_t>(content.size()));
   package[13] = static_cast<std::byte>(0xed);
   put_u32_be(package, 14, 1);
   put_u32_be(package, 18, static_cast<std::uint32_t>(name.size()));
@@ -778,7 +779,7 @@ int main() {
 
     std::atomic_bool cancel_requested{};
     const auto batch_summary = wedecode::BatchRunner(wedecode::Logger{}).run({*first_account}, cancel_requested);
-    assert(batch_summary.succeeded == 1);
+    assert(batch_summary.partial == 1);
     const auto project_output = batch_summary.batch_output;
     assert(wedecode::read_text_utf8(project_output / "app-service.js").find("测试小程序") != std::string::npos);
     assert(wedecode::read_text_utf8(project_output / "data-package" / "game.data") == "cached data package");
@@ -806,7 +807,8 @@ int main() {
 
     const auto multi_summary = wedecode::BatchRunner(wedecode::Logger{}).run(
         {multi_first, multi_second}, cancel_requested);
-    assert(multi_summary.succeeded == 2);
+    assert(multi_summary.succeeded + multi_summary.partial == 2);
+    assert(multi_summary.failed == 0);
     assert(multi_summary.batch_output == output_root);
     assert(wedecode::read_text_utf8(output_root / "multi-project-a" / "app-service.js").find("测试小程序") != std::string::npos);
     assert(wedecode::read_text_utf8(output_root / "multi-project-b" / "app-service.js").find("测试小程序") != std::string::npos);
@@ -834,6 +836,17 @@ int main() {
                                  .scan_applet_roots({nested_root}, nullptr, nullptr);
     assert(nested_scan.inputs.size() == 1);
     assert(nested_scan.inputs.front().missing_subpackages.empty());
+
+    const auto manual_root = root / "wx9988776655443322";
+    wedecode::write_binary(manual_root / "2" / "__APP__.wxapkg", make_single_file_package("/version.txt", "old"));
+    wedecode::write_binary(manual_root / "10" / "__APP__.wxapkg", make_single_file_package("/version.txt", "new"));
+    const auto manual_inputs = wedecode::BatchRunner(wedecode::Logger{}).prepare_inputs({manual_root});
+    const auto manual_summary = wedecode::BatchRunner(wedecode::Logger{}).run(manual_inputs, cancel_requested);
+    assert(manual_summary.succeeded == 1);
+    const auto manual_project = manual_summary.batch_output / "wx9988776655443322";
+    assert(wedecode::read_text_utf8(manual_project / "version.txt") == "new");
+    assert(wedecode::read_text_utf8(manual_project / L"_历史版本" / "2" / "__APP__" / "version.txt") == "old");
+    fs::remove_all(manual_summary.batch_output);
 
     fs::remove_all(project_output);
     fs::remove_all(output_root / "multi-project-a");

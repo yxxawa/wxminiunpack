@@ -21,6 +21,7 @@
 - **搜索、多选、全选**：支持按名称、WXID、插件和账号过滤，也可以一次处理多个项目。
 - **手动导入**：拖入一个或多个最外层 WXID 文件夹；文件夹名作为对应 wxapkg 的 WXID。
 - **完整性报告**：输出解包清单、缺失分包、依赖来源、处理状态和 `app-config.json` 证据。
+- **源码提取**：拆分主包、游戏和插件的 JS 模块，提取内嵌页面 JSON 与 WXSS；未恢复的模板会列入报告。
 - **现代桌面界面**：原生 C++ 窗口承载 WebView2 UI，支持浅色/深色主题、DPI 适配和高清拖放区域。
 - **本地优先处理**：解包、合并和输出都在本机完成；名称补全优先使用本地证据，网络补全失败时仍可继续解包。
 
@@ -106,7 +107,7 @@ output/
 │  ├─ 项目甲/
 │  │  ├─ app.json
 │  │  ├─ app-config.json
-│  │  ├─ unpack-manifest.json
+│  │  ├─ 解包清单.json
 │  │  ├─ pages/
 │  │  ├─ common/
 │  │  └─ ...
@@ -120,12 +121,15 @@ output/
 | --- | --- |
 | `app.json` | 从 `app-config.json` 整理出的页面入口配置（存在有效配置时生成） |
 | `app-config.json` | wxapkg 中的原始应用配置证据 |
-| `unpack-manifest.json` | 输入包、WXID、依赖、分包完整性和处理状态 |
+| `reconstruction-report.json` | 源码恢复数量、未恢复的页面/组件文件及解析警告 |
+| `解包清单.json` | 输入包、WXID、依赖、分包完整性和处理状态 |
 | `pages/`、`components/`、`common/` | 解出的源码与资源目录，实际以包内容为准 |
 | `__PLUGINCODE__` 等目录 | 插件或分包解包结果 |
 | `runtime-cache/` | 发现并纳入项目的运行时缓存文件（若有） |
 
-缺失分包会在 `unpack-manifest.json` 的 `subpackagesNotPresentInLocalWxapkgCache` 中列出，并在运行日志中提示。`sourceCompleteness` 与 `analysisCompleteness` 用于区分“wxapkg 是否齐全”和“运行时缓存是否提供了补充证据”。
+缺失分包会在 `解包清单.json` 的 `subpackagesNotPresentInLocalWxapkgCache` 中列出，并在运行日志中提示。`sourceCompleteness` 与 `analysisCompleteness` 用于区分“wxapkg 是否齐全”和“运行时缓存是否提供了补充证据”。
+
+源码恢复报告中出现缺失模板或警告时，任务显示“部分完成”。编译后的 WXML 尚未完整反编译，不会生成空页面冒充恢复结果。真实样本验证与已修问题见 [解包检查记录](docs/UNPACKING_AUDIT.md)。
 
 ## 工作原理
 
@@ -174,7 +178,7 @@ flowchart LR
 
 ### 为什么出现 `app-config.json was not found`？
 
-当前项目包里没有找到有效的 `app-config.json`。工具仍会解出可读取的文件，并跳过依赖该配置的页面默认值生成；具体原因会写入日志和 `unpack-manifest.json`。
+当前项目包里没有找到有效的 `app-config.json`。工具仍会解出可读取的文件，并尝试提取内嵌的配置；具体原因会写入日志、`解包清单.json` 和 `reconstruction-report.json`。
 
 ### 输出是完整的吗？
 
@@ -183,7 +187,7 @@ flowchart LR
 1. **包源完整性**：本机是否存在主包、分包和实际引用插件的 wxapkg。
 2. **分析完整性**：运行时缓存是否补充了 wxapkg 中没有的 Unity/WebGL/Wasm 或资源证据。
 
-请以每个项目的 `unpack-manifest.json` 和日志为准。
+请以每个项目的 `解包清单.json`、`reconstruction-report.json` 和日志为准。
 
 ### WebView2 启动时报错
 

@@ -6,7 +6,9 @@
 #include <bcrypt.h>
 
 #include <array>
+#include <algorithm>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 
 #pragma comment(lib, "bcrypt.lib")
@@ -120,6 +122,11 @@ bool Wxapkg::has_valid_header(const std::vector<std::byte>& bytes) {
 }
 
 std::vector<std::byte> Wxapkg::decrypt(std::string_view wxid, const std::vector<std::byte>& encrypted) {
+  constexpr std::string_view signature = "V1MMWX";
+  if (encrypted.size() < signature.size() ||
+      std::memcmp(encrypted.data(), signature.data(), signature.size()) != 0) {
+    throw std::runtime_error("Unsupported wxapkg format: expected BE/ED or V1MMWX header");
+  }
   if (wxid.empty()) throw std::runtime_error("The input folder name is required as WXID for an encrypted wxapkg");
   const auto decrypted_head = decrypt_first_block(wxid, encrypted);
   const auto xor_key = wxid.size() >= 2 ? static_cast<std::uint8_t>(wxid[wxid.size() - 2]) : 0x66;
@@ -130,23 +137,30 @@ std::vector<std::byte> Wxapkg::decrypt(std::string_view wxid, const std::vector<
   for (std::size_t index = 6 + 1024; index < encrypted.size(); ++index) {
     result.push_back(static_cast<std::byte>(byte_at(encrypted, index) ^ xor_key));
   }
+  if (!has_valid_header(result)) throw std::runtime_error("wxapkg decryption failed: check the package WXID");
   return result;
 }
 
 std::vector<PackFileEntry> Wxapkg::read_file_index(const std::vector<std::byte>& package) {
   if (!has_valid_header(package)) throw std::runtime_error("The wxapkg header markers are invalid");
 
-  const auto index_end = static_cast<std::size_t>(read_u32_be(package, 5)) + 18U;
+  // The index length includes the four-byte file count after the 14-byte header.
+  const auto index_end = static_cast<std::size_t>(read_u32_be(package, 5)) + 14U;
   const auto file_count = read_u32_be(package, 14);
   if (index_end > package.size() || index_end < 18) throw std::runtime_error("wxapkg file index extends beyond the package");
+  if (file_count > (index_end - 18) / 13) throw std::runtime_error("wxapkg file count cannot fit in its index");
+  const auto body_length = read_u32_be(package, 9);
+  if (body_length != package.size() - index_end) throw std::runtime_error("wxapkg body length does not match the package size");
 
   std::size_t cursor = 18;
   std::vector<PackFileEntry> entries;
+  std::map<std::string, PackFileEntry> paths;
   entries.reserve(file_count);
   for (std::uint32_t index = 0; index < file_count; ++index) {
+    if (index_end - cursor < 12) throw std::runtime_error("wxapkg file index is truncated");
     const auto name_length = read_u32_be(package, cursor);
     cursor += 4;
-    if (name_length > index_end - cursor) throw std::runtime_error("wxapkg file name extends beyond the index");
+    if (name_length == 0 || name_length > index_end - cursor - 8) throw std::runtime_error("wxapkg file name extends beyond the index");
     std::string packed_path;
     packed_path.reserve(name_length);
     for (std::size_t byte = 0; byte < name_length; ++byte) packed_path.push_back(static_cast<char>(byte_at(package, cursor + byte)));
@@ -157,9 +171,19 @@ std::vector<PackFileEntry> Wxapkg::read_file_index(const std::vector<std::byte>&
     cursor += 4;
     if (cursor > index_end) throw std::runtime_error("wxapkg file index is malformed");
     if (static_cast<std::uint64_t>(offset) + size > package.size()) throw std::runtime_error("wxapkg file entry extends beyond the package");
+    if (offset < index_end) throw std::runtime_error("wxapkg file entry overlaps the header or index");
     if (!is_safe_relative_path(packed_path)) throw std::runtime_error("wxapkg contains an unsafe file path: " + packed_path);
-    entries.push_back({normalise_relative_path(packed_path), offset, size});
+    auto relative = path_from_utf8(normalise_relative_path(packed_path)).lexically_normal();
+    const auto path = wide_to_utf8(relative.generic_wstring());
+    const auto [previous, inserted] = paths.emplace(to_lower_ascii(path), PackFileEntry{path, offset, size});
+    if (!inserted && (previous->second.size != size ||
+        !std::equal(package.begin() + previous->second.offset,
+                    package.begin() + previous->second.offset + size, package.begin() + offset))) {
+      throw std::runtime_error("wxapkg contains conflicting output paths: " + path);
+    }
+    entries.push_back({path, offset, size});
   }
+  if (cursor != index_end) throw std::runtime_error("wxapkg file index length does not match its entries");
   return entries;
 }
 

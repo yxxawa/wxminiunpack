@@ -281,7 +281,8 @@ void write_unpack_manifest(const fs::path& project_directory,
                            const std::size_t package_successes,
                            const std::size_t package_failures,
                            const std::size_t files_extracted,
-                           const RuntimeCacheCopyResult& runtime_cache) {
+                            const RuntimeCacheCopyResult& runtime_cache,
+                            const ReconstructionResult* reconstruction = nullptr) {
   std::size_t dependency_package_count{};
   for (const auto& dependency : input.dependencies) {
     dependency_package_count += dependency.package_files.empty() ? dependency.package_count : dependency.package_files.size();
@@ -297,15 +298,19 @@ void write_unpack_manifest(const fs::path& project_directory,
        << "  \"failedPackageCount\": " << package_failures << ",\n"
        << "  \"extractedFileCount\": " << files_extracted << ",\n"
        << "  \"sourceCompleteness\": \""
-       << (input.missing_subpackages.empty() ?
+       << (package_failures == 0 && input.missing_subpackages.empty() && input.missing_dependency_wxids.empty() ?
            (input.platform_conditional_subpackages.empty() && input.runtime_or_external_subpackages.empty()
                 ? "declared-packages-present"
                 : "local-cache-complete-for-current-platform")
            : "partial") << "\",\n"
        << "  \"analysisCompleteness\": \""
        << (runtime_cache.files_copied != 0 ? "runtime-cache-supplemented"
-                                          : (input.missing_subpackages.empty() ? "source-complete" : "package-partial"))
+                                          : (reconstruction && reconstruction->complete() ? "available-content-recovered" : "source-recovery-partial"))
        << "\",\n"
+       << "  \"sourceReconstruction\": {\"status\":\""
+       << (reconstruction ? (reconstruction->complete() ? "available-content-recovered" : "partial") : "not-attempted")
+       << "\",\"report\":\"reconstruction-report.json\",\"missingSourceFileCount\":"
+       << (reconstruction ? reconstruction->missing_source_files.size() : 0) << "},\n"
        << "  \"declaredSubpackages\": " << json_string_array(input.declared_subpackages) << ",\n"
        << "  \"subpackagesNotPresentInLocalWxapkgCache\": " << json_string_array(input.missing_subpackages) << ",\n"
        << "  \"platformConditionalSubpackages\": " << json_string_array(input.platform_conditional_subpackages) << ",\n"
@@ -396,6 +401,12 @@ void BatchRunner::sort_main_package_first(std::vector<fs::path>& packages) {
     const bool left_main = is_main_package(left);
     const bool right_main = is_main_package(right);
     if (left_main != right_main) return left_main;
+    if (package_slot_key(left) == package_slot_key(right)) {
+      const auto left_version = numeric_version(left.parent_path());
+      const auto right_version = numeric_version(right.parent_path());
+      if (left_version.has_value() != right_version.has_value()) return left_version.has_value();
+      if (left_version && right_version && *left_version != *right_version) return *left_version > *right_version;
+    }
     return to_lower_ascii(filename_utf8(left)) < to_lower_ascii(filename_utf8(right));
   });
 }
@@ -596,15 +607,19 @@ BatchSummary BatchRunner::run(const std::vector<InputFolder>& inputs, std::atomi
     }
 
     bool reconstruction_failed{};
+    ReconstructionResult reconstruction;
     try {
-      SourceReconstructor(logger_).reconstruct(project_directory);
+      reconstruction = SourceReconstructor(logger_).reconstruct(project_directory);
+      reconstruction_failed = !reconstruction.complete();
     } catch (const std::exception& error) {
       reconstruction_failed = true;
+      reconstruction.warnings.push_back(error.what());
       logger_.error(input.display_name + "：主程序已解包，但源码重建失败：" + error.what());
     }
     for (const auto& dependency_directory : dependency_directories) {
       try {
-        SourceReconstructor(logger_).reconstruct(dependency_directory);
+        const auto recovered = SourceReconstructor(logger_).reconstruct(dependency_directory);
+        reconstruction_failed = reconstruction_failed || !recovered.complete();
       } catch (const std::exception& error) {
         reconstruction_failed = true;
         logger_.error("通用插件源码重建失败：" + wide_to_utf8(dependency_directory.filename().wstring()) + "：" + error.what());
@@ -612,21 +627,32 @@ BatchSummary BatchRunner::run(const std::vector<InputFolder>& inputs, std::atomi
     }
     for (const auto& historical_directory : historical_directories) {
       try {
-        SourceReconstructor(logger_).reconstruct(historical_directory);
+        const auto recovered = SourceReconstructor(logger_).reconstruct(historical_directory);
+        reconstruction_failed = reconstruction_failed || !recovered.complete();
       } catch (const std::exception& error) {
         reconstruction_failed = true;
         logger_.error("历史版本包源码重建失败：" + wide_to_utf8(historical_directory.wstring()) + "：" + error.what());
       }
     }
 
-    if (package_failures == 0 && additional_failures == 0 && !reconstruction_failed && !cancel_requested.load()) {
+    try {
+      write_unpack_manifest(project_directory, input, packages, main_package_successes,
+                            main_package_failures, files_extracted, runtime_cache, &reconstruction);
+    } catch (const std::exception& error) {
+      ++additional_failures;
+      logger_.warning("写入解包清单失败：" + std::string(error.what()));
+    }
+
+    if (package_failures == 0 && additional_failures == 0 && !reconstruction_failed &&
+        input.missing_subpackages.empty() && input.missing_dependency_wxids.empty() && !cancel_requested.load()) {
       ++summary.succeeded;
       logger_.success(input.display_name + "：反编译完成");
     } else {
       ++summary.partial;
       logger_.warning(input.display_name + "：已完成主要内容，包缺失或处理失败 " +
-                      std::to_string(package_failures) + " 个，资源复制失败 " +
-                      std::to_string(additional_failures) + " 个");
+                      std::to_string(package_failures + input.missing_subpackages.size() + input.missing_dependency_wxids.size()) +
+                      " 个，资源复制失败 " + std::to_string(additional_failures) +
+                      " 个；源码重建详情见 reconstruction-report.json");
     }
   }
 

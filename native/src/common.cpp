@@ -180,11 +180,17 @@ std::string normalise_relative_path(std::string_view packed_path) {
 
 bool is_safe_relative_path(std::string_view packed_path) {
   const std::string path = normalise_relative_path(packed_path);
-  if (path.empty() || path.find(':') != std::string::npos) return false;
+  if (path.empty() || path.find_first_of(":<>\"|?*") != std::string::npos ||
+      std::any_of(path.begin(), path.end(), [](unsigned char c) { return c < 0x20; })) return false;
   fs::path relative = path_from_utf8(path).lexically_normal();
   if (relative.empty() || relative.is_absolute()) return false;
   for (const auto& part : relative) {
-    if (part == "..") return false;
+    const auto text = to_lower_ascii(wide_to_utf8(part.wstring()));
+    if (text.empty() || text == "." || text == ".." || text.back() == '.' || text.back() == ' ') return false;
+    const auto stem = text.substr(0, text.find('.'));
+    if (stem == "con" || stem == "prn" || stem == "aux" || stem == "nul" ||
+        (stem.size() == 4 && (stem.starts_with("com") || stem.starts_with("lpt")) &&
+         stem[3] >= '1' && stem[3] <= '9')) return false;
   }
   return true;
 }

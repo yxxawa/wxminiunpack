@@ -1,6 +1,7 @@
 #include "wedecode/reconstructor.h"
 
 #include "wedecode/common.h"
+#include "js_reader.h"
 
 #include <algorithm>
 #include <cctype>
@@ -37,7 +38,9 @@ struct JsonValue {
 
 class JsonParser {
 public:
-  explicit JsonParser(std::string_view input) : input_(input) {}
+  explicit JsonParser(std::string_view input) : input_(input) {
+    if (input_.starts_with("\xef\xbb\xbf")) position_ = 3;
+  }
 
   JsonValue parse() {
     auto value = parse_value();
@@ -116,46 +119,18 @@ private:
 
   std::string parse_string() {
     if (take() != '"') throw std::runtime_error("Expected JSON string");
-    std::string result;
+    const auto start = position_ - 1;
     while (position_ < input_.size()) {
       const char current = take();
-      if (current == '"') return result;
-      if (static_cast<unsigned char>(current) < 0x20) throw std::runtime_error("Control character in JSON string");
-      if (current != '\\') { result.push_back(current); continue; }
-      const char escape = take();
-      switch (escape) {
-        case '"': result.push_back('"'); break;
-        case '\\': result.push_back('\\'); break;
-        case '/': result.push_back('/'); break;
-        case 'b': result.push_back('\b'); break;
-        case 'f': result.push_back('\f'); break;
-        case 'n': result.push_back('\n'); break;
-        case 'r': result.push_back('\r'); break;
-        case 't': result.push_back('\t'); break;
-        case 'u': {
-          if (position_ + 4 > input_.size()) throw std::runtime_error("Short JSON unicode escape");
-          unsigned codepoint{};
-          for (int index = 0; index < 4; ++index) {
-            const char hex = take();
-            codepoint <<= 4U;
-            if (hex >= '0' && hex <= '9') codepoint |= hex - '0';
-            else if (hex >= 'a' && hex <= 'f') codepoint |= hex - 'a' + 10;
-            else if (hex >= 'A' && hex <= 'F') codepoint |= hex - 'A' + 10;
-            else throw std::runtime_error("Invalid JSON unicode escape");
-          }
-          if (codepoint <= 0x7f) result.push_back(static_cast<char>(codepoint));
-          else if (codepoint <= 0x7ff) {
-            result.push_back(static_cast<char>(0xc0 | (codepoint >> 6U)));
-            result.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-          } else {
-            result.push_back(static_cast<char>(0xe0 | (codepoint >> 12U)));
-            result.push_back(static_cast<char>(0x80 | ((codepoint >> 6U) & 0x3f)));
-            result.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
-          }
-          break;
-        }
-        default: throw std::runtime_error("Invalid JSON escape");
+      if (current == '"') {
+        const auto decoded = detail::decode_js_string(input_.substr(start, position_ - start));
+        if (!decoded) throw std::runtime_error("Invalid JSON unicode escape");
+        return *decoded;
       }
+      if (static_cast<unsigned char>(current) < 0x20) throw std::runtime_error("Control character in JSON string");
+      if (current != '\\') continue;
+      const char escape = take();
+      if (std::string_view("\"\\/bfnrtu").find(escape) == std::string_view::npos) throw std::runtime_error("Invalid JSON escape");
     }
     throw std::runtime_error("Unterminated JSON string");
   }
@@ -253,77 +228,87 @@ std::string remove_html_suffix(std::string path) {
 }
 
 std::string sanitise_module_path(std::string path) {
-  if (path.starts_with("plugin-private://")) path = "plugin_/" + path.substr(std::string("plugin-private://").size());
-  const auto marker = path.find("__plugin__");
-  if (marker != std::string::npos) path.replace(marker, std::string("__plugin__").size(), "plugin_");
+  if (path.starts_with("plugin-private://")) path = "__plugin__/" + path.substr(std::string("plugin-private://").size());
   return normalise_relative_path(path);
 }
 
-std::size_t skip_js_string(const std::string& text, std::size_t position) {
-  const char quote = text[position++];
-  while (position < text.size()) {
-    if (text[position] == '\\') { position += 2; continue; }
-    if (text[position++] == quote) break;
-  }
-  return position;
-}
-
-std::optional<std::size_t> matching_js_brace(const std::string& text, std::size_t open) {
-  if (open >= text.size() || text[open] != '{') return std::nullopt;
-  int depth{};
-  for (std::size_t position = open; position < text.size(); ++position) {
-    const char current = text[position];
-    if (current == '\'' || current == '"' || current == '`') { position = skip_js_string(text, position) - 1; continue; }
-    if (current == '/' && position + 1 < text.size() && text[position + 1] == '/') {
-      const auto end = text.find('\n', position + 2);
-      if (end == std::string::npos) return std::nullopt;
-      position = end;
+std::optional<std::string> decode_stylesheet(const std::string& code,
+                                            const std::vector<detail::JsToken>& tokens,
+                                            std::size_t start, const std::string& filename) {
+  const auto end = tokens[start].match;
+  if (end == detail::no_token) return std::nullopt;
+  std::string css;
+  for (auto i = start + 1; i < end; ++i) {
+    const auto text = tokens[i].text(code);
+    if (text == ",") continue;
+    if (tokens[i].kind == detail::JsToken::Kind::string) {
+      const auto value = detail::decode_js_string(text);
+      if (!value) return std::nullopt;
+      css += *value;
       continue;
     }
-    if (current == '/' && position + 1 < text.size() && text[position + 1] == '*') {
-      const auto end = text.find("*/", position + 2);
-      if (end == std::string::npos) return std::nullopt;
-      position = end + 1;
-      continue;
-    }
-    if (current == '{') ++depth;
-    else if (current == '}' && --depth == 0) return position;
+    if (text != "[" || tokens[i].match == detail::no_token) return std::nullopt;
+    const auto close = tokens[i].match;
+    if (close <= i + 1) return std::nullopt;
+    const auto operation = tokens[i + 1].text(code);
+    if (operation == "0" && close > i + 3 && tokens[i + 2].text(code) == ",") {
+      auto number = trim(std::string_view(code).substr(tokens[i + 3].begin, tokens[close].begin - tokens[i + 3].begin));
+      std::size_t consumed{};
+      try { const auto value = std::stod(number, &consumed); (void)value; } catch (...) { return std::nullopt; }
+      if (consumed != number.size()) return std::nullopt;
+      css += number + "rpx";
+    } else if (operation == "1" && close == i + 2) {
+      // Component scope prefixes are generated by the runtime, not source WXSS.
+    } else if (operation == "2" && close == i + 4 && tokens[i + 2].text(code) == ",") {
+      auto imported = detail::decode_js_string(tokens[i + 3].text(code));
+      if (!imported) return std::nullopt;
+      auto path = sanitise_module_path(*imported);
+      if (!is_safe_relative_path(path)) return std::nullopt;
+      const auto relative = path_from_utf8(path).lexically_normal().lexically_relative(path_from_utf8(filename).parent_path());
+      css += "@import \"" + wide_to_utf8(relative.generic_wstring()) + "\";\n";
+    } else return std::nullopt;
+    i = close;
   }
-  return std::nullopt;
-}
-
-std::optional<std::pair<std::string, std::size_t>> read_js_quoted(const std::string& code, std::size_t position) {
-  while (position < code.size() && std::isspace(static_cast<unsigned char>(code[position]))) ++position;
-  if (position >= code.size() || (code[position] != '\'' && code[position] != '"')) return std::nullopt;
-  const char quote = code[position++];
-  std::string value;
-  while (position < code.size()) {
-    const char current = code[position++];
-    if (current == quote) return std::pair{value, position};
-    if (current == '\\' && position < code.size()) value.push_back(code[position++]);
-    else value.push_back(current);
-  }
-  return std::nullopt;
+  return css;
 }
 
 }  // namespace
 
 SourceReconstructor::SourceReconstructor(Logger logger) : logger_(std::move(logger)) {}
 
-void SourceReconstructor::reconstruct(const fs::path& project_directory) {
+ReconstructionResult SourceReconstructor::reconstruct(const fs::path& project_directory) {
+  result_ = {};
   const bool game = fs::exists(project_directory / "game.js");
-  if (game) normalise_game_config(project_directory);
-  else reconstruct_app_config(project_directory);
   reconstruct_define_modules(project_directory);
-  if (!game) create_missing_page_files(project_directory);
+  if (!game) reconstruct_app_config(project_directory);
+  if (!game) inspect_missing_page_files(project_directory);
   create_project_config(project_directory);
-  logger_.success(std::string(game ? "Mini-game" : "Mini-program") + " reconstruction completed: " + wide_to_utf8(project_directory.filename().wstring()));
+  JsonValue report = JsonValue::make_object();
+  const auto number = [](std::size_t count) { JsonValue value; value.type = JsonValue::Type::number; value.number = static_cast<double>(count); return value; };
+  report.object["javascriptModules"] = number(result_.javascript_modules);
+  report.object["jsonFiles"] = number(result_.json_files);
+  report.object["stylesheets"] = number(result_.stylesheets);
+  report.object["status"] = JsonValue::make_string(result_.complete() ? "available-content-recovered" : "partial");
+  report.object["templateRecovery"] = JsonValue::make_string("Compiled WXML is preserved in the original containers; missing source files are not replaced with placeholders.");
+  for (const auto& [key, values] : std::map<std::string, std::vector<std::string>>{
+           {"missingSourceFiles", result_.missing_source_files}, {"warnings", result_.warnings}}) {
+    auto list = JsonValue::make_array();
+    for (const auto& value : values) list.array.push_back(JsonValue::make_string(value));
+    report.object[key] = std::move(list);
+  }
+  write_text_utf8(project_directory / "reconstruction-report.json", stringify_json(report));
+  if (result_.complete()) logger_.success("Recovered available source content: " + wide_to_utf8(project_directory.filename().wstring()));
+  else logger_.warning("Source recovery is partial; see reconstruction-report.json (missing files: " + std::to_string(result_.missing_source_files.size()) + ")");
+  return result_;
 }
 
 void SourceReconstructor::reconstruct_app_config(const fs::path& project_directory) {
+  // An embedded source app.json is more authoritative than the runtime config.
+  if (fs::exists(project_directory / "app.json")) return;
   const auto source = project_directory / "app-config.json";
   if (!fs::exists(source)) {
     logger_.warning("app-config.json was not found; page defaults are skipped");
+    if (fs::exists(project_directory / "app-service.js")) result_.warnings.push_back("No app.json or app-config.json was available");
     return;
   }
   try {
@@ -334,12 +319,27 @@ void SourceReconstructor::reconstruct_app_config(const fs::path& project_directo
       for (const auto& [key, value] : global->object) config.object[key] = value;
     }
     config.object.erase("global");
+    if (const auto pages = member(config, "page"); pages && pages->is_object()) {
+      for (const auto& [name, metadata] : pages->object) {
+        const auto path = sanitise_module_path(remove_html_suffix(name) + ".json");
+        if (!is_safe_relative_path(path) || !metadata.is_object()) continue;
+        auto page = metadata;
+        if (const auto window = member(metadata, "window"); window && window->is_object()) {
+          page.object.erase("window");
+          for (const auto& [key, value] : window->object) page.object[key] = value;
+        }
+        if (!fs::exists(project_directory / path_from_utf8(path))) {
+          write_text_utf8(project_directory / path_from_utf8(path), stringify_json(page), false);
+          ++result_.json_files;
+        }
+      }
+    }
     config.object.erase("page");
 
     if (auto entry = member(config, "entryPagePath"); entry && entry->is_string()) entry->string = remove_html_suffix(entry->string);
     if (auto renderer = member(config, "renderer")) {
       if (renderer->is_object()) {
-        if (const auto default_renderer = member(*renderer, "default"); default_renderer && default_renderer->is_string()) *renderer = *default_renderer;
+        if (const auto default_renderer = member(*renderer, "default"); default_renderer && default_renderer->is_string()) *renderer = JsonValue::make_string(default_renderer->string);
         else *renderer = JsonValue::make_string("webview");
       }
     }
@@ -353,16 +353,20 @@ void SourceReconstructor::reconstruct_app_config(const fs::path& project_directo
       write_text_utf8(project_directory / "ext.json", stringify_json(ext));
     }
     config.object.erase("ext");
-    config.object.erase("navigateToMiniProgramAppIdList");
-
-    if (auto plugins = member(config, "plugins")) *plugins = JsonValue::make_object();
     if (auto framework = member(config, "componentFramework"); framework && framework->is_object()) {
-      if (const auto default_value = member(*framework, "default")) *framework = *default_value;
-      else if (const auto all_used = member(*framework, "allUsed"); all_used && all_used->is_array() && !all_used->array.empty()) *framework = all_used->array.front();
+      if (const auto default_value = member(*framework, "default")) { auto value = *default_value; *framework = std::move(value); }
+      else if (const auto all_used = member(*framework, "allUsed"); all_used && all_used->is_array() && !all_used->array.empty()) { auto value = all_used->array.front(); *framework = std::move(value); }
     }
 
-    const auto all_pages = string_array(member(config, "pages"));
+    auto all_pages = string_array(member(config, "pages"));
+    for (auto& page : all_pages) page = remove_html_suffix(page);
     std::set<std::string> main_pages(all_pages.begin(), all_pages.end());
+    if (!member(config, "subPackages")) {
+      if (const auto sub = member(config, "subpackages")) {
+        config.object["subPackages"] = *sub;
+        config.object.erase("subpackages");
+      }
+    }
     if (auto sub_packages = member(config, "subPackages"); sub_packages && sub_packages->is_array()) {
       JsonValue::Array normalised;
       for (auto sub_package : sub_packages->array) {
@@ -373,111 +377,209 @@ void SourceReconstructor::reconstruct_app_config(const fs::path& project_directo
         if (!root.ends_with('/')) root.push_back('/');
         root_member->string = root;
         JsonValue pages = JsonValue::make_array();
+        std::set<std::string> sub_pages;
+        for (auto page : string_array(member(sub_package, "pages"))) {
+          page = remove_html_suffix(page);
+          if (page.starts_with(root)) page.erase(0, root.size());
+          if (sub_pages.insert(page).second) pages.array.push_back(JsonValue::make_string(page));
+          main_pages.erase(root + page);
+        }
         for (const auto& page : all_pages) {
           if (page.starts_with(root)) {
-            pages.array.push_back(JsonValue::make_string(page.substr(root.size())));
+            const auto relative = page.substr(root.size());
+            if (sub_pages.insert(relative).second) pages.array.push_back(JsonValue::make_string(relative));
             main_pages.erase(page);
           }
         }
         sub_package.object["pages"] = std::move(pages);
-        if (auto plugins = member(sub_package, "plugins")) *plugins = JsonValue::make_object();
-        if (!sub_package.object["pages"].array.empty()) normalised.push_back(std::move(sub_package));
+        normalised.push_back(std::move(sub_package));
       }
       sub_packages->array = std::move(normalised);
     }
     JsonValue main = JsonValue::make_array();
     for (const auto& page : all_pages) if (main_pages.contains(page)) main.array.push_back(JsonValue::make_string(remove_html_suffix(page)));
-    if (!main.array.empty()) config.object["pages"] = std::move(main);
+    config.object["pages"] = std::move(main);
 
     write_text_utf8(project_directory / "app.json", stringify_json(config));
     logger_.success("Generated app.json from app-config.json");
   } catch (const std::exception& error) {
+    result_.warnings.push_back(std::string("Could not transform app-config.json: ") + error.what());
     logger_.warning(std::string("Could not transform app-config.json: ") + error.what());
   }
 }
 
 void SourceReconstructor::reconstruct_define_modules(const fs::path& project_directory) {
-  std::size_t recovered{};
   std::set<fs::path> source_files;
-  for (const auto& item : fs::recursive_directory_iterator(project_directory, fs::directory_options::skip_permission_denied)) {
+  for (fs::recursive_directory_iterator it(project_directory, fs::directory_options::skip_permission_denied), end; it != end; ++it) {
+    const auto& item = *it;
+    if (item.is_directory()) {
+      const auto name = wide_to_utf8(item.path().filename().wstring());
+      if (name == "runtime-cache" || name == "_历史版本" || name == "通用插件") it.disable_recursion_pending();
+      continue;
+    }
     if (!item.is_regular_file()) continue;
     const auto name = to_lower_ascii(wide_to_utf8(item.path().filename().wstring()));
-    if (name == "app-service.js" || name.ends_with(".appservice.js") || name.ends_with(".webview.js")) source_files.insert(item.path());
+    if (name == "app-service.js" || name == "app-wxss.js" || name == "page-frame.js" ||
+        name == "plugin.js" || name == "game.js" || name == "subcontext.js" ||
+        name.ends_with(".appservice.js") || name.ends_with(".webview.js") || name.ends_with(".html")) source_files.insert(item.path());
   }
 
   for (const auto& source : source_files) {
     std::string code;
     try { code = read_text_utf8(source); }
-    catch (...) { continue; }
-    std::size_t position{};
-    while ((position = code.find("define(", position)) != std::string::npos) {
-      const auto module = read_js_quoted(code, position + 7);
-      if (!module) { position += 7; continue; }
-      const auto safe_path = sanitise_module_path(module->first);
-      const auto function_position = code.find("function", module->second);
-      if (function_position == std::string::npos || function_position > code.find(';', module->second)) { position = module->second; continue; }
-      const auto open = code.find('{', function_position);
-      const auto close = matching_js_brace(code, open == std::string::npos ? code.size() : open);
-      if (!close || !is_safe_relative_path(safe_path)) { position = module->second; continue; }
-      if (path_from_utf8(safe_path).extension() == ".js") {
-        write_text_utf8(project_directory / path_from_utf8(safe_path), code.substr(open + 1, *close - open - 1));
-        ++recovered;
+    catch (const std::exception& error) { result_.warnings.push_back(error.what()); continue; }
+    if (source.extension() == ".html") {
+      std::string scripts;
+      const auto lower = to_lower_ascii(code);
+      std::size_t position{};
+      while ((position = lower.find("<script", position)) != std::string::npos) {
+        const auto begin = lower.find('>', position + 7);
+        if (begin == std::string::npos) break;
+        const auto end = lower.find("</script", begin + 1);
+        if (end == std::string::npos) break;
+        scripts.append(code, begin + 1, end - begin - 1);
+        scripts.push_back('\n');
+        position = end + 8;
       }
-      position = *close + 1;
+      code = std::move(scripts);
+    }
+    const auto tokens = detail::tokenize_js(code);
+    const auto is = [&](std::size_t i, std::string_view text) { return i < tokens.size() && tokens[i].text(code) == text; };
+    const auto save = [&](std::string path, std::string_view content, std::size_t& counter) {
+      path = sanitise_module_path(std::move(path));
+      if (!is_safe_relative_path(path)) return;
+      const auto output = project_directory / path_from_utf8(path);
+      if (fs::exists(output)) return;
+      write_text_utf8(output, content, false);
+      ++counter;
+    };
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      if (is(i, "define") && (i == 0 || (!is(i - 1, ".") && !is(i - 1, "function"))) && is(i + 1, "(") &&
+          i + 4 < tokens.size() && tokens[i + 2].kind == detail::JsToken::Kind::string && is(i + 3, ",")) {
+        auto factory = i + 4;
+        if (is(factory, "[") && tokens[factory].match != detail::no_token && is(tokens[factory].match + 1, ",")) factory = tokens[factory].match + 2;
+        if (!is(factory, "function")) continue;
+        ++factory;
+        if (factory < tokens.size() && tokens[factory].kind == detail::JsToken::Kind::word) ++factory;
+        if (!is(factory, "(") || tokens[factory].match == detail::no_token) continue;
+        const auto open = tokens[factory].match + 1;
+        if (!is(open, "{") || tokens[open].match == detail::no_token) continue;
+        const auto close = tokens[open].match;
+        const auto module = detail::decode_js_string(tokens[i + 2].text(code));
+        if (module) {
+          auto path = sanitise_module_path(*module);
+          auto extension = path_from_utf8(path).extension();
+          if (extension.empty()) { path += ".js"; extension = ".js"; }
+          if (extension == ".js" || extension == ".wxs") {
+            save(path, std::string_view(code).substr(tokens[open].end, tokens[close].begin - tokens[open].end), result_.javascript_modules);
+          }
+        }
+        i = close;
+        continue;
+      }
+      if ((is(i, "__wxAppCode__") || is(i, "__COMMON_STYLESHEETS__")) && is(i + 1, "[") &&
+          i + 5 < tokens.size() && tokens[i + 2].kind == detail::JsToken::Kind::string &&
+          is(i + 3, "]") && is(i + 4, "=") && !is(i + 5, "=")) {
+        const auto name = detail::decode_js_string(tokens[i + 2].text(code));
+        if (!name) continue;
+        const auto path = sanitise_module_path(*name);
+        const auto value = i + 5;
+        if (path.ends_with(".json") && is(value, "{") && tokens[value].match != detail::no_token) {
+          const auto close = tokens[value].match;
+          try {
+            const auto json = JsonParser(std::string_view(code).substr(tokens[value].begin, tokens[close].end - tokens[value].begin)).parse();
+            save(path, stringify_json(json), result_.json_files);
+          } catch (const std::exception& error) {
+            result_.warnings.push_back("Could not recover " + path + ": " + error.what());
+          }
+          i = close;
+        } else if (path.ends_with(".wxss")) {
+          const auto array = is(value, "[") ? value : (is(value, "setCssToHead") && is(value + 1, "(") ? value + 2 : detail::no_token);
+          if (array != detail::no_token && is(array, "[")) {
+            if (const auto css = decode_stylesheet(code, tokens, array, path)) save(path, *css, result_.stylesheets);
+            else result_.warnings.push_back("Unsupported stylesheet tokens in " + path);
+          }
+        }
+      }
+      // Global WXSS calls identify their source through a {path:"./app.wxss"} argument.
+      if (is(i, "setCssToHead") && is(i + 1, "(") && is(i + 2, "[") && tokens[i + 1].match != detail::no_token) {
+        const auto end = tokens[i + 1].match;
+        const auto array_end = tokens[i + 2].match;
+        if (array_end == detail::no_token) continue;
+        for (auto p = array_end + 1; p + 2 < end; ++p) {
+          if (!is(p, "path") || !is(p + 1, ":")) continue;
+          const auto name = detail::decode_js_string(tokens[p + 2].text(code));
+          if (!name || !name->ends_with(".wxss")) continue;
+          const auto path = sanitise_module_path(*name);
+          if (const auto css = decode_stylesheet(code, tokens, i + 2, path)) save(path, *css, result_.stylesheets);
+          else result_.warnings.push_back("Unsupported stylesheet tokens in " + path);
+          break;
+        }
+      }
     }
   }
-  if (recovered != 0) logger_.success("Recovered " + std::to_string(recovered) + " JavaScript modules from define() containers");
+  logger_.info("Recovered " + std::to_string(result_.javascript_modules) + " JS modules, " +
+               std::to_string(result_.json_files) + " JSON files and " + std::to_string(result_.stylesheets) + " WXSS files");
 }
 
-void SourceReconstructor::create_missing_page_files(const fs::path& project_directory) {
-  const auto app_json = project_directory / "app.json";
-  if (!fs::exists(app_json)) return;
+void SourceReconstructor::inspect_missing_page_files(const fs::path& project_directory) {
+  const auto app_json = fs::exists(project_directory / "app.json") ? project_directory / "app.json" : project_directory / "plugin.json";
   std::set<std::string> pages;
-  try {
+  if (fs::exists(app_json)) try {
     const auto config = JsonParser(read_text_utf8(app_json)).parse();
     for (auto page : string_array(member(config, "pages"))) pages.insert(remove_html_suffix(std::move(page)));
-    if (const auto sub_packages = member(config, "subPackages"); sub_packages && sub_packages->is_array()) {
+    if (const auto exported = member(config, "pages"); exported && exported->is_object()) {
+      for (const auto& [name, page] : exported->object) {
+        (void)name;
+        if (page.is_string()) pages.insert(remove_html_suffix(page.string));
+      }
+    }
+    const auto sub_packages = member(config, "subPackages") ? member(config, "subPackages") : member(config, "subpackages");
+    if (sub_packages && sub_packages->is_array()) {
       for (const auto& sub_package : sub_packages->array) {
         const auto root = member(sub_package, "root");
         if (!root || !root->is_string()) continue;
-        for (const auto& page : string_array(member(sub_package, "pages"))) pages.insert(normalise_relative_path(root->string + page));
+        auto prefix = normalise_relative_path(root->string);
+        if (!prefix.ends_with('/')) prefix.push_back('/');
+        for (const auto& page : string_array(member(sub_package, "pages"))) pages.insert(remove_html_suffix(prefix + page));
       }
     }
-  } catch (...) {
-    return;
+  } catch (const std::exception& error) {
+    result_.warnings.push_back(std::string("Could not inspect page configuration: ") + error.what());
   }
 
   for (const auto& page : pages) {
     if (!is_safe_relative_path(page)) continue;
-    auto base = project_directory / path_from_utf8(page);
-    auto json = base; json.replace_extension(".json");
-    auto js = base; js.replace_extension(".js");
-    auto wxml = base; wxml.replace_extension(".wxml");
-    if (!fs::exists(json)) write_text_utf8(json, "{\n  \"component\": true\n}\n", false);
-    if (!fs::exists(js)) write_text_utf8(js, "Page({ data: {} })\n", false);
-    if (!fs::exists(wxml)) write_text_utf8(wxml, "<text>" + page + ".wxml</text>\n", false);
+    for (const auto extension : {".js", ".wxml"}) {
+      const auto name = page + extension;
+      if (!fs::exists(project_directory / path_from_utf8(name))) result_.missing_source_files.push_back(name);
+    }
   }
-  if (!pages.empty()) logger_.info("Ensured source files for " + std::to_string(pages.size()) + " pages/components");
+  // Components recovered from embedded JSON need templates as well.
+  for (fs::recursive_directory_iterator it(project_directory, fs::directory_options::skip_permission_denied), end; it != end; ++it) {
+    const auto& item = *it;
+    if (item.is_directory()) {
+      const auto name = wide_to_utf8(item.path().filename().wstring());
+      if (name == "runtime-cache" || name == "_历史版本" || name == "通用插件") it.disable_recursion_pending();
+      continue;
+    }
+    if (!item.is_regular_file() || item.path().extension() != ".json") continue;
+    try {
+      const auto config = JsonParser(read_text_utf8(item.path())).parse();
+      const auto component = member(config, "component");
+      if (!component || component->type != JsonValue::Type::boolean || !component->boolean) continue;
+      auto wxml = item.path(); wxml.replace_extension(".wxml");
+      if (!fs::exists(wxml)) result_.missing_source_files.push_back(wide_to_utf8(wxml.lexically_relative(project_directory).generic_wstring()));
+    } catch (...) { /* Non-source asset JSON does not affect page recovery. */ }
+  }
+  std::sort(result_.missing_source_files.begin(), result_.missing_source_files.end());
+  result_.missing_source_files.erase(std::unique(result_.missing_source_files.begin(), result_.missing_source_files.end()), result_.missing_source_files.end());
 }
 
 void SourceReconstructor::create_project_config(const fs::path& project_directory) {
   const auto config = project_directory / "project.private.config.json";
   if (!fs::exists(config)) {
     write_text_utf8(config, "{\n  \"setting\": {\n    \"es6\": false,\n    \"urlCheck\": false\n  }\n}\n");
-  }
-}
-
-void SourceReconstructor::normalise_game_config(const fs::path& project_directory) {
-  const auto game_json = project_directory / "game.json";
-  if (!fs::exists(game_json)) return;
-  try {
-    auto config = JsonParser(read_text_utf8(game_json)).parse();
-    if (config.is_object()) {
-      config.object.erase("openDataContext");
-      write_text_utf8(game_json, stringify_json(config));
-    }
-  } catch (const std::exception& error) {
-    logger_.warning(std::string("Could not normalise game.json: ") + error.what());
   }
 }
 
